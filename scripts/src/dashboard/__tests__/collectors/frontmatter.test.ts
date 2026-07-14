@@ -158,6 +158,34 @@ describe("parseFrontmatterJson", () => {
     expect(meta!.checks).toBe(3);
   });
 
+  it("stores the raw description verbatim — no truncation, sanitizing, or whitespace changes", () => {
+    // A description longer than the old 500-char sanitize limit, containing
+    // internal runs of whitespace and newlines that whitespace-normalization
+    // would previously have collapsed.
+    const rawDescription =
+      "First line with  multiple   spaces.\nSecond line.\t" + "x".repeat(600);
+    const raw = JSON.stringify({
+      skills: [
+        {
+          name: "verbatim",
+          path: "plugin/skills/verbatim/SKILL.md",
+          status: "pass",
+          errors: [],
+          warnings: [],
+          checks: { "name-format": true },
+          description: rawDescription,
+        },
+      ],
+      summary: { total: 1, passed: 1, failed: 0, warnings: 0 },
+    });
+
+    const report = parseFrontmatterJson(raw);
+    const meta = report.items[0].metadata;
+
+    expect(meta!.description).toBe(rawDescription);
+    expect((meta!.description as string).length).toBe(rawDescription.length);
+  });
+
   it("sets skipped to 0 in summary", () => {
     const report = parseFrontmatterJson(makeFrontmatterJson());
     expect(report.summary.skipped).toBe(0);
@@ -183,9 +211,14 @@ describe("frontmatterCollector.collect", () => {
 
   it("returns a valid CategoryReport from CLI output", async () => {
     const jsonOutput = makeFrontmatterJson();
+    const capturedArgs: unknown[] = [];
+    const execFileSync = vi.fn((...args: unknown[]) => {
+      capturedArgs.splice(0, capturedArgs.length, ...args);
+      return jsonOutput;
+    });
 
     vi.doMock("node:child_process", () => ({
-      execSync: () => jsonOutput,
+      execFileSync,
     }));
 
     const { frontmatterCollector } = await import(
@@ -199,6 +232,15 @@ describe("frontmatterCollector.collect", () => {
 
     expect(report.status).toBe("pass");
     expect(report.items).toHaveLength(2);
+    expect(capturedArgs[0]).toBe(process.execPath);
+    expect(capturedArgs[1]).toEqual(expect.arrayContaining(["run", "frontmatter", "--", "--json"]));
+    expect(capturedArgs[2]).toEqual(expect.objectContaining({
+      cwd: expect.stringContaining("scripts"),
+      timeout: 5000,
+    }));
+    const callArgs = capturedArgs[1] as unknown as string[];
+    expect(String(callArgs[0])).toContain("npm-cli");
+    expect(callArgs[5]).toMatch(/output[\\/]+skills$/);
   });
 
   it("handles non-zero exit with valid JSON stdout", async () => {
@@ -217,7 +259,7 @@ describe("frontmatterCollector.collect", () => {
     });
 
     vi.doMock("node:child_process", () => ({
-      execSync: () => {
+      execFileSync: () => {
         const err = new Error("exit code 1") as Error & { stdout: string };
         err.stdout = jsonOutput;
         throw err;
@@ -239,8 +281,30 @@ describe("frontmatterCollector.collect", () => {
 
   it("returns skip when CLI is not found", async () => {
     vi.doMock("node:child_process", () => ({
-      execSync: () => {
+      execFileSync: () => {
         throw new Error("ENOENT: npm not found");
+      },
+    }));
+
+    const { frontmatterCollector } = await import(
+      "../../collectors/frontmatter.js"
+    );
+
+    const report = await frontmatterCollector.collect({
+      cwd: "/fake",
+      timeout: 5000,
+    });
+
+    expect(report.status).toBe("skip");
+    expect(report.summary.total).toBe(0);
+  });
+
+  it("returns skip when non-zero exit stdout is not valid JSON", async () => {
+    vi.doMock("node:child_process", () => ({
+      execFileSync: () => {
+        const err = new Error("exit code 1") as Error & { stdout: string };
+        err.stdout = "npm ERR! something broke";
+        throw err;
       },
     }));
 

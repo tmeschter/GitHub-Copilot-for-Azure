@@ -12,15 +12,15 @@
  *   4. Name must not start with reserved prefixes (claude- or anthropic-).
  *
  * Usage:
- *   npm run frontmatter                 # Validate all skills
- *   npm run frontmatter <skill>         # Validate a single skill
- *   npm run frontmatter <path/SKILL.md> # Validate a specific file
+ *   npm run frontmatter <path/SKILL.md>        # Validate a specific SKILL.md file
+ *   npm run frontmatter <path/skills/mySkill>  # Validate a single skill folder
+ *   npm run frontmatter <path/skills>          # Validate all skills in a directory
+ *   npm run frontmatter <path1> <path2> ...    # Mix of the above
  */
 
 import { dirname, resolve, basename, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { parseSkillContent } from "../shared/skill-helper.js";
 
@@ -32,8 +32,6 @@ function getRepoRoot(): string {
 }
 
 const REPO_ROOT = getRepoRoot();
-const PLUGIN_SKILLS_DIR = resolve(REPO_ROOT, "plugin", "skills");
-const META_SKILLS_DIR = resolve(REPO_ROOT, ".github", "skills");
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,6 +45,8 @@ export interface ValidationResult {
   skill: string;
   file: string;
   issues: ValidationIssue[];
+  /** Raw description text, or null when missing/unparseable. */
+  description?: string | null;
 }
 
 export interface SkillRoutingContext {
@@ -382,11 +382,9 @@ const TRIGGER_SECTION_RE = new RegExp(
 const DO_NOT_USE_FOR_RE = /\bDO NOT USE FOR:/i;
 const SANITIZED_DO_NOT_USE_FOR_MARKER = "DO_NOT_USE_FOR:";
 const DISAMBIGUATION_CLAUSE_MARKER_RE = new RegExp(`(?:${SANITIZED_DO_NOT_USE_FOR_MARKER}|PREFER OVER\\b)`, "i");
-const PREFER_OVER_RE = /\bPREFER OVER\b/i;
 const BROAD_SKILL_NAMES = new Set(["azure-prepare", "azure-deploy"]);
 const MIN_TRIGGER_PHRASE_LENGTH = 4;
 const OVERLAP_PREVIEW_LIMIT = 3;
-const DEFAULT_REMOTE_BASE_REF = "origin/main";
 
 function normalizeTriggerPhrase(phrase: string): string {
   return phrase
@@ -430,11 +428,6 @@ export function hasPreferOverClause(description: string | null, competingSkillNa
   return new RegExp(`\\bPREFER OVER\\s+${escapedName}\\b`, "i").test(description);
 }
 
-function hasAnyPreferOverClause(description: string | null): boolean {
-  if (!description) return false;
-  return PREFER_OVER_RE.test(description);
-}
-
 function hasAnyDisambiguationClause(description: string | null, competingSkillName: string): boolean {
   return hasDoNotUseForClause(description) || hasPreferOverClause(description, competingSkillName);
 }
@@ -463,51 +456,6 @@ function isBroadRoutingSkill(name: string): boolean {
   // Restrict "broad" classification to an explicit allowlist to avoid
   // specialized skills being accidentally reclassified as broad.
   return BROAD_SKILL_NAMES.has(name);
-}
-
-function getMergeBaseRef(): string | null {
-  // Prefer merge-base with common default branches first (remote then local), then
-  // fall back to HEAD~1 for environments where base branches are unavailable.
-  const baseRefCandidates = [DEFAULT_REMOTE_BASE_REF, "origin/master", "main", "master"];
-  for (const baseRef of baseRefCandidates) {
-    try {
-      return execFileSync("git", ["merge-base", "HEAD", baseRef], {
-        cwd: REPO_ROOT,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-    } catch {
-      // Try next candidate base ref.
-    }
-  }
-
-  try {
-    return execFileSync("git", ["rev-parse", "HEAD~1"], {
-      cwd: REPO_ROOT,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return null;
-  }
-}
-
-function getDescriptionFromGitRef(filePath: string, ref: string): string | null {
-  const relativeFilePath = relative(REPO_ROOT, filePath).replace(/\\/g, "/");
-  try {
-    const previousContent = execFileSync("git", ["show", `${ref}:${relativeFilePath}`], {
-      cwd: REPO_ROOT,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const parsed = parseSkillContent(previousContent);
-    if (parsed === null || typeof parsed.data.description !== "string") {
-      return null;
-    }
-    return parsed.data.description;
-  } catch {
-    return null;
-  }
 }
 
 export function validateTriggerOverlapDisambiguation(
@@ -542,46 +490,6 @@ export function validateTriggerOverlapDisambiguation(
   return issues;
 }
 
-function validateDisambiguationRemoval(skill: SkillRoutingContext, mergeBaseRef: string | null): ValidationIssue[] {
-  if (mergeBaseRef === null) return [];
-
-  const previousDescription = getDescriptionFromGitRef(skill.file, mergeBaseRef);
-  return buildDisambiguationRemovalIssues(previousDescription, skill.description);
-}
-
-export function isDisambiguationClauseRemoved(previousDescription: string | null, currentDescription: string | null): boolean {
-  const previousHasDisambiguation = hasDoNotUseForClause(previousDescription) || hasAnyPreferOverClause(previousDescription);
-  const currentHasDisambiguation = hasDoNotUseForClause(currentDescription) || hasAnyPreferOverClause(currentDescription);
-  return previousHasDisambiguation && !currentHasDisambiguation;
-}
-
-function getRemovedDisambiguationClauses(previousDescription: string | null, currentDescription: string | null): string[] {
-  const removed: string[] = [];
-  if (hasDoNotUseForClause(previousDescription) && !hasDoNotUseForClause(currentDescription)) {
-    removed.push("DO NOT USE FOR");
-  }
-  if (hasAnyPreferOverClause(previousDescription) && !hasAnyPreferOverClause(currentDescription)) {
-    removed.push("PREFER OVER");
-  }
-  return removed;
-}
-
-export function buildDisambiguationRemovalIssues(
-  previousDescription: string | null,
-  currentDescription: string | null,
-): ValidationIssue[] {
-  if (previousDescription === null) return [];
-  if (!isDisambiguationClauseRemoved(previousDescription, currentDescription)) return [];
-  const removedClauses = getRemovedDisambiguationClauses(previousDescription, currentDescription);
-  const clauseLabel = removedClauses.length === 1 ? removedClauses[0] : removedClauses.join(" and ");
-  const clauseWord = removedClauses.length === 1 ? "clause" : "clauses";
-  return [{
-    check: "disambiguation-removal",
-    severity: "error",
-    message: `Removed disambiguation ${clauseWord}: ${clauseLabel}. Re-add a DO NOT USE FOR or PREFER OVER clause if trigger overlap still exists.`,
-  }];
-}
-
 // ── Validate a single SKILL.md ──────────────────────────────────────────────
 
 export function validateSkillFile(filePath: string): ValidationResult {
@@ -592,7 +500,7 @@ export function validateSkillFile(filePath: string): ValidationResult {
 
   if (parsed === null) {
     issues.push({ check: "frontmatter", message: "Missing YAML frontmatter (file must start with ---)" });
-    return { skill: parentDir, file: filePath, issues };
+    return { skill: parentDir, file: filePath, issues, description: null };
   }
 
   const name = typeof parsed.data.name === "string" ? parsed.data.name : null;
@@ -633,7 +541,7 @@ export function validateSkillFile(filePath: string): ValidationResult {
   // Check 10: Allowed tools field
   issues.push(...validateAllowedTools(parsed.data["allowed-tools"]));
 
-  return { skill: parentDir, file: filePath, issues };
+  return { skill: parentDir, file: filePath, issues, description };
 }
 
 // ── Skill discovery ──────────────────────────────────────────────────────────
@@ -651,8 +559,60 @@ function findSkillFiles(skillsDir: string): string[] {
     .map((name) => resolve(skillsDir, name, "SKILL.md"));
 }
 
-function getAllSkillFiles(): string[] {
-  return [...findSkillFiles(PLUGIN_SKILLS_DIR), ...findSkillFiles(META_SKILLS_DIR)];
+function getRoutingRoot(skillFile: string): string {
+  return dirname(dirname(skillFile));
+}
+
+/**
+ * Resolve a CLI positional argument to one or more SKILL.md file paths and
+ * the skill-container roots needed for trigger-overlap validation.
+ *
+ * Accepted forms:
+ *   1. Path to a SKILL.md file directly
+ *   2. Path to a skill folder (directory containing SKILL.md)
+ *   3. Path to a skills container (directory of skill subdirectories)
+ */
+function resolveSkillSelection(arg: string): { skillFiles: string[]; routingRoots: string[] } | string {
+  const resolved = resolve(arg);
+
+  if (!existsSync(resolved)) {
+    return `Path not found: ${arg}`;
+  }
+
+  const st = statSync(resolved);
+
+  if (st.isFile()) {
+    if (basename(resolved) !== "SKILL.md") {
+      return `Expected a SKILL.md file but got: ${arg}`;
+    }
+    return {
+      skillFiles: [resolved],
+      routingRoots: [getRoutingRoot(resolved)],
+    };
+  }
+
+  if (st.isDirectory()) {
+    const directSkillMd = resolve(resolved, "SKILL.md");
+    if (existsSync(directSkillMd)) {
+      // Skill folder — the directory itself is the skill
+      return {
+        skillFiles: [directSkillMd],
+        routingRoots: [getRoutingRoot(directSkillMd)],
+      };
+    }
+
+    // Skills container — enumerate subdirectories
+    const found = findSkillFiles(resolved);
+    if (found.length === 0) {
+      return `No skills found in directory: ${arg}`;
+    }
+    return {
+      skillFiles: found,
+      routingRoots: [resolved],
+    };
+  }
+
+  return `Path is neither a file nor a directory: ${arg}`;
 }
 
 // ── JSON output ──────────────────────────────────────────────────────────────
@@ -682,6 +642,8 @@ export interface FrontmatterSkillResult {
   errors: string[];
   warnings: string[];
   checks: Record<string, boolean>;
+  /** Raw description text ("" when missing). Length is derivable by consumers. */
+  description: string;
 }
 
 export interface FrontmatterJsonResult {
@@ -723,6 +685,7 @@ function buildJsonResult(results: ValidationResult[]): FrontmatterJsonResult {
       passed++;
     }
 
+    const description = result.description ?? "";
     skills.push({
       name: result.skill,
       path: relative(REPO_ROOT, result.file).replace(/\\/g, "/"),
@@ -730,6 +693,7 @@ function buildJsonResult(results: ValidationResult[]): FrontmatterJsonResult {
       errors: errors.map(e => `[${e.check}] ${e.message}`),
       warnings: warnings.map(w => `[${w.check}] ${w.message}`),
       checks,
+      description,
     });
   }
 
@@ -758,46 +722,41 @@ function main(): void {
 
   const jsonOutput = values.json ?? false;
 
-  let skillFiles: string[];
+  const selectedArgs = positionals.length === 0
+    ? [resolve(REPO_ROOT, "output", "skills")]
+    : positionals;
 
-  if (positionals.length > 0) {
-    skillFiles = [];
-    for (const arg of positionals) {
-      // Accept either a skill name or a direct path to SKILL.md
-      if (arg.endsWith("SKILL.md") && existsSync(arg)) {
-        skillFiles.push(resolve(arg));
-      } else {
-        // Try as skill name in both directories
-        const pluginPath = resolve(PLUGIN_SKILLS_DIR, arg, "SKILL.md");
-        const metaPath = resolve(META_SKILLS_DIR, arg, "SKILL.md");
+  const skillFiles: string[] = [];
+  const routingRoots = new Set<string>();
 
-        if (existsSync(pluginPath)) {
-          skillFiles.push(pluginPath);
-        } else if (existsSync(metaPath)) {
-          skillFiles.push(metaPath);
-        } else {
-          console.error(`\n❌ Skill "${arg}" not found in plugin/skills/ or .github/skills/\n`);
-          process.exitCode = 1;
-          return;
-        }
-      }
+  for (const arg of selectedArgs) {
+    const result = resolveSkillSelection(arg);
+    if (typeof result === "string") {
+      console.error(`\n❌ ${result}\n`);
+      process.exitCode = 1;
+      return;
     }
-  } else {
-    skillFiles = getAllSkillFiles();
+
+    for (const file of result.skillFiles) {
+      skillFiles.push(file);
+    }
+    for (const root of result.routingRoots) {
+      routingRoots.add(root);
+    }
   }
+
+  const uniqueSkillFiles = [...new Set(skillFiles)];
 
   // Validate all skill files
   const results: ValidationResult[] = [];
-  const routingContexts = buildSkillRoutingContexts(getAllSkillFiles());
+  const routingContexts = buildSkillRoutingContexts([...routingRoots].flatMap((root) => findSkillFiles(root)));
   const routingContextByName = new Map(routingContexts.map((context) => [context.name, context]));
-  const mergeBaseRef = getMergeBaseRef();
 
-  for (const file of skillFiles) {
+  for (const file of uniqueSkillFiles) {
     const result = validateSkillFile(file);
     const routingContext = routingContextByName.get(result.skill);
     if (routingContext) {
       result.issues.push(...validateTriggerOverlapDisambiguation(routingContext, routingContexts));
-      result.issues.push(...validateDisambiguationRemoval(routingContext, mergeBaseRef));
     }
     results.push(result);
   }
